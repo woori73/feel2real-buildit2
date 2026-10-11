@@ -1,0 +1,7 @@
+abb661cd2fc53677d040fe0be3f241bbb8c0fad9619192a83109d53bd514bfb9  designcraft/designcraft-0.6.0-linux-x86_64.tar.gz
+725c88cf379122d70f941dd3edacb54479d63ff1e2a00fae318eaee02ad762c4  effectcraft/effectcraft-0.8.0-linux-x86_64.tar.gz
+b3d706d599699ead76b46a29d5697287b9f75a0bc9eb40f7733db7657dae8204  filmcraft/filmcraft-0.6.0-linux-x86_64.tar.gz
+d738f16b3a717b1e66716981aa4f8dbd68caa5bf9d04d175801a2278f18f69f1  lightcraft/lightcraft-0.6.0-linux-x86_64.tar.gz
+edbfde7991ddf08aa8a7a0a60b32227e275c5601accf5c13ce2eefbea9060b69  pdfcraft/pdfcraft-cli-0.6.0-linux-x86_64.tar.gz
+641f831252fd31b43ee1a12e572d7442e5652c2e5bf623de085741c370f0c91d  photocraft/photocraft-0.7.0-linux-x86_64.tar.gz
+afbc4a0904740dfd1208e717664eb294965055e74c227c2ac3dc53af502e46a4  vectorcraft/vectorcraft-0.9.0-linux-x86_64.tar.gz
