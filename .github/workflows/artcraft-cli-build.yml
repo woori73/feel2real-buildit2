@@ -35,7 +35,7 @@ jobs:
             crate: vectorcraft-cli
           - product: lightcraft
             version: "0.6.0"
-            rust: "1.90.0"
+            rust: "1.95.0"
             crate: lightcraft-cli
           - product: filmcraft
             version: "0.6.0"
