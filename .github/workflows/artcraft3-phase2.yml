@@ -1,0 +1,126 @@
+name: ArtCraft 3-new Verify Phase2 (fix word + magic)
+
+# Phase1 교정: WordCraft 는 select.text(존재 텍스트 선택) 대신 text.insert/md→docx 로 문서 작성,
+# SHA 비교는 계산값==기대값 문자열 대조(파일명 bug 제거), 모든 산출물에 file magic+자체 readback.
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - artcraft-3/qoder-iso
+
+permissions:
+  contents: read
+
+jobs:
+  verify:
+    runs-on: ubuntu-24.04
+    env:
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - name: Install deps
+        run: sudo apt-get update && sudo apt-get install -y fonts-noto-cjk fonts-nanum
+
+      - name: Prepare + download 3 tarballs
+        run: |
+          set -e
+          mkdir -p dl tools logs samples out
+          for r in wordcraft deckcraft gridcraft; do
+            curl -sSL -o "dl/$r.tar.gz" "https://github.com/storytold/$r/releases/download/v0.5.0/$r-0.5.0-linux-x86_64.tar.gz"
+            curl -sSL -o "dl/$r.SHA256SUMS.txt" "https://github.com/storytold/$r/releases/download/v0.5.0/SHA256SUMS.txt"
+          done
+
+      - name: Verify SHA-256 (computed == official expected string)
+        run: |
+          set +e
+          for r in wordcraft deckcraft gridcraft; do
+            exp=$(grep "$r-0.5.0-linux-x86_64.tar.gz" "dl/$r.SHA256SUMS.txt" | awk '{print $1}')
+            act=$(sha256sum "dl/$r.tar.gz" | awk '{print $1}')
+            echo "$r expected=$exp"
+            echo "$r actual  =$act"
+            [ "$exp" = "$act" ] && echo "$r SHA=MATCH" || echo "$r SHA=MISMATCH"
+          done | tee logs/sha_clean.txt
+
+      - name: Extract + normalize CLI
+        run: |
+          set +e
+          for r in wordcraft deckcraft gridcraft; do
+            mkdir -p "dl/$r"; tar -xzf "dl/$r.tar.gz" -C "dl/$r"
+            bin=$(find dl/$r -type f -path "*/bin/$r-cli" | head -1)
+            mkdir -p "tools/$r"; cp "$bin" "tools/$r/cli"; chmod +x "tools/$r/cli"
+          done
+          for r in wordcraft deckcraft gridcraft; do ( cd tools/$r && sha256sum cli ); done | tee logs/cli_sha256.txt
+
+      - name: WordCraft DOCX+PDF with Korean (md route + text.insert route) + readback
+        run: |
+          set +e
+          W=tools/wordcraft/cli
+          # (A) 마크다운(한글) -> DOCX -> PDF
+          cat > samples/wc_korean.md <<'MD'
+          # 한글 보고서 제목
+
+          이 문서는 ArtCraft WordCraft 검증용 **한글** 샘플입니다.
+          월 수강료 15만원, 상담 010-0000-0000.
+          MD
+          $W convert samples/wc_korean.md out/wc_md.docx > logs/wordcraft_md.txt 2>&1; echo "md2docx exit=$?" >> logs/wordcraft_md.txt
+          $W convert out/wc_md.docx out/wc_md.pdf >> logs/wordcraft_md.txt 2>&1; echo "docx2pdf exit=$?" >> logs/wordcraft_md.txt
+          $W text out/wc_md.docx >> logs/wordcraft_md.txt 2>&1; echo "text exit=$?" >> logs/wordcraft_md.txt
+          # (B) run --cmd text.insert -> DOCX
+          $W run --cmd 'text.insert={"text":"한글 테스트 문서 제목"}' --cmd text.newParagraph --cmd 'text.insert={"text":"두 번째 문단"}' --save out/wc_insert.docx > logs/wordcraft_insert.txt 2>&1; echo "insert exit=$?" >> logs/wordcraft_insert.txt
+          $W convert out/wc_insert.docx out/wc_insert.pdf >> logs/wordcraft_insert.txt 2>&1; echo "insert->pdf exit=$?" >> logs/wordcraft_insert.txt
+          echo "--- (A) md route ---"; cat logs/wordcraft_md.txt
+          echo "--- (B) insert route ---"; cat logs/wordcraft_insert.txt
+          echo "--- file magic ---"; file out/wc_*.* 2>&1
+
+      - name: DeckCraft PPTX+PDF+render regenerate + magic
+        run: |
+          set +e
+          D=tools/deckcraft/cli
+          mkdir -p out/deck_png
+          $D render --sample --all --scale 1 out/deck_png/ > logs/deckcraft_render.txt 2>&1; echo "render exit=$?" >> logs/deckcraft_render.txt
+          $D run --sample --cmd 'slide.new={"layout":"titleOnly","title":"한글 발표 제목"}' --save out/dc.pptx > logs/deckcraft_pptx.txt 2>&1; echo "pptx exit=$?" >> logs/deckcraft_pptx.txt
+          $D run --sample --save out/dc.deckcraft --export out/deck.pdf >> logs/deckcraft_pptx.txt 2>&1; echo "pdf exit=$?" >> logs/deckcraft_pptx.txt
+          echo "--- deck ---"; cat logs/deckcraft_render.txt logs/deckcraft_pptx.txt
+          echo "--- magic ---"; file out/dc.pptx out/deck.pdf out/deck_png/slide-01.png 2>&1
+
+      - name: GridCraft XLSX+CSV+Korean regenerate + magic
+        run: |
+          set +e
+          G=tools/gridcraft/cli
+          $G run --sample budget --cmd 'home.bold={"range":"B4:F4"}' --out out/grid_budget.xlsx > logs/gridcraft_xlsx.txt 2>&1; echo "xlsx exit=$?" >> logs/gridcraft_xlsx.txt
+          $G run --sample budget --out out/grid.csv >> logs/gridcraft_xlsx.txt 2>&1; echo "csv exit=$?" >> logs/gridcraft_xlsx.txt
+          $G cat out/grid_budget.xlsx --range A1:E8 >> logs/gridcraft_xlsx.txt 2>&1; echo "cat exit=$?" >> logs/gridcraft_xlsx.txt
+          $G eval '="한글 셀"' > logs/gridcraft_korean.txt 2>&1; echo "eval exit=$?" >> logs/gridcraft_korean.txt
+          echo "--- grid ---"; tail -6 logs/gridcraft_xlsx.txt; cat logs/gridcraft_korean.txt
+          echo "--- magic + csv head ---"; file out/grid_budget.xlsx out/grid.csv 2>&1; head -3 out/grid.csv 2>&1
+
+      - name: Summary
+        run: |
+          set +e
+          {
+            echo "# Phase2 추가 3종 판정"
+            echo "## SHA clean"; grep -E "MATCH|MISMATCH" logs/sha_clean.txt
+            echo "## CLI SHA"; cat logs/cli_sha256.txt
+            echo "## file magic (모든 산출물)"
+            for r in wordcraft deckcraft gridcraft; do
+              case $r in
+                wordcraft) files="out/wc_md.docx out/wc_md.pdf out/wc_insert.docx out/wc_insert.pdf";;
+                deckcraft) files="out/dc.pptx out/deck.pdf out/deck_png/slide-01.png";;
+                gridcraft) files="out/grid_budget.xlsx out/grid.csv";;
+              esac
+              echo "-- $r --"; file $files 2>&1
+            done
+            echo "## WordCraft 한글 회수(text)"; grep -iE "한글|수강료" logs/wordcraft_md.txt | head -3
+            echo "## GridCraft 한글 eval"; grep "한글" logs/gridcraft_korean.txt
+            echo "## 산출물 크기"; ls -l out/*.docx out/*.pdf out/*.pptx out/*.xlsx out/*.csv 2>/dev/null
+          } > logs/PHASE2_SUMMARY.txt
+          cat logs/PHASE2_SUMMARY.txt
+
+      - name: Upload Phase2
+        uses: actions/upload-artifact@v4
+        with:
+          name: artcraft3-verify-phase2
+          path: |
+            logs/
+            out/
+          if-no-files-found: warn
+          retention-days: 30
