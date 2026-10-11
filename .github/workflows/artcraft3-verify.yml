@@ -1,0 +1,188 @@
+name: ArtCraft 3-new Verify (Word/Deck/Grid)
+
+# 추가 3종(WordCraft/DeckCraft/GridCraft)을 storytold 원본 릴리스에서 직접 확보(GitHub Actions
+# Ubuntu 24.04 격리). VM 복사·main 병합·기존 7종 수정 금지. 빌드/다운로드 성공=PASS 아님:
+# 실제 CLI 실행 + 샘플 문서/발표/시트 생성 + 판독 + 한글 + MCP tools/call 로 판정.
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - artcraft-3/qoder-iso
+
+permissions:
+  contents: read
+
+jobs:
+  verify:
+    runs-on: ubuntu-24.04
+    env:
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - name: Install isolated env deps (Korean fonts + tools)
+        run: sudo apt-get update && sudo apt-get install -y fonts-noto-cjk fonts-nanum imagemagick librsvg2-bin
+
+      - name: Prepare dirs
+        run: mkdir -p dl tools logs samples out
+
+      - name: Download 3 Linux tarballs from ORIGINAL storytold releases
+        run: |
+          set -e
+          for r in wordcraft deckcraft gridcraft; do
+            curl -sSL -o "dl/$r.tar.gz" "https://github.com/storytold/$r/releases/download/v0.5.0/$r-0.5.0-linux-x86_64.tar.gz"
+            curl -sSL -o "dl/$r.SHA256SUMS.txt" "https://github.com/storytold/$r/releases/download/v0.5.0/SHA256SUMS.txt"
+          done
+          ls -l dl/
+
+      - name: Verify SHA-256 vs official SHA256SUMS.txt
+        run: |
+          set +e
+          for r in wordcraft deckcraft gridcraft; do
+            echo "===== $r ====="
+            ( cd dl && grep "$r-0.5.0-linux-x86_64.tar.gz" "$r.SHA256SUMS.txt" | sha256sum -c - ) 2>&1 | tee -a "logs/${r}_sha.txt"
+            ( cd dl && sha256sum "$r.tar.gz" ) >> "logs/${r}_sha.txt"
+            cat "logs/${r}_sha.txt"
+          done
+
+      - name: Extract + normalize CLI, record CLI SHA-256 + filetype + ldd
+        run: |
+          set +e
+          for r in wordcraft deckcraft gridcraft; do
+            mkdir -p "dl/$r"
+            tar -xzf "dl/$r.tar.gz" -C "dl/$r" 2>/dev/null
+            bin=$(find dl/$r -type f -path "*/bin/$r-cli" | head -1)
+            mkdir -p "tools/$r"
+            cp "$bin" "tools/$r/cli"; chmod +x "tools/$r/cli"
+            ( cd "tools/$r" && sha256sum cli ) >> logs/cli_sha256.txt
+            file "tools/$r/cli" >> logs/cli_filetype.txt
+            ldd "tools/$r/cli" > "logs/$r--ldd.txt" 2>&1
+            echo "== $r =="; cat "logs/$r--ldd.txt" | grep -iE "not found" || echo "deps resolved"
+          done
+          cat logs/cli_sha256.txt logs/cli_filetype.txt
+
+      - name: Discover CLI (--version, --help, commands) for each tool
+        run: |
+          set +e
+          for r in wordcraft deckcraft gridcraft; do
+            b="tools/$r/cli"
+            "$b" --version > "logs/$r--version.txt" 2>&1; echo "exit=$?" >> "logs/$r--version.txt"
+            echo "===== $r --version ====="; cat "logs/$r--version.txt"
+            "$b" --help > "logs/$r--help.txt" 2>&1; echo "exit=$?" >> "logs/$r--help.txt"
+            echo "===== $r --help ====="; cat "logs/$r--help.txt"
+            "$b" commands > "logs/$r--commands.txt" 2>&1; echo "exit=$?" >> "logs/$r--commands.txt"
+          done
+
+      - name: WordCraft real DOCX + PDF (with Korean) + readback
+        run: |
+          set +e
+          W=tools/wordcraft/cli
+          $W run --template sample --cmd 'select.text={"text":"한글 테스트 문서 제목"}' --cmd format.bold --save out/wc_korean.docx > logs/wordcraft_run.txt 2>&1; echo "run exit=$?" >> logs/wordcraft_run.txt
+          $W convert out/wc_korean.docx out/wc_korean.pdf >> logs/wordcraft_run.txt 2>&1; echo "conv exit=$?" >> logs/wordcraft_run.txt
+          $W text out/wc_korean.docx > logs/wordcraft_text.txt 2>&1; echo "text exit=$?" >> logs/wordcraft_text.txt
+          $W inspect out/wc_korean.docx > logs/wordcraft_inspect.txt 2>&1; echo "inspect exit=$?" >> logs/wordcraft_inspect.txt
+          echo "--- wordcraft outputs ---"; cat logs/wordcraft_run.txt; file out/wc_korean.* 2>&1
+          echo "--- text (한글 회수) ---"; cat logs/wordcraft_text.txt
+
+      - name: DeckCraft real render + PPTX/PDF export attempts + readback
+        run: |
+          set +e
+          D=tools/deckcraft/cli
+          mkdir -p out/deck_png
+          $D render --sample --all --scale 1 out/deck_png/ > logs/deckcraft_render.txt 2>&1; echo "render exit=$?" >> logs/deckcraft_render.txt
+          $D run --sample --cmd 'slide.new={"layout":"titleOnly","title":"한글 발표 제목"}' --save out/dc.pptx > logs/deckcraft_pptx.txt 2>&1; echo "pptx exit=$?" >> logs/deckcraft_pptx.txt
+          $D run --sample --cmd 'slide.new={"layout":"titleOnly","title":"한글 발표 제목"}' --save out/dc.deckcraft --export out/deck.pdf >> logs/deckcraft_pptx.txt 2>&1; echo "deck+export exit=$?" >> logs/deckcraft_pptx.txt
+          echo "--- deckcraft render ---"; cat logs/deckcraft_render.txt; ls -l out/deck_png/ | head
+          echo "--- deckcraft export ---"; cat logs/deckcraft_pptx.txt; file out/dc.pptx out/deck.pdf out/deck_png/* 2>&1 | head
+
+      - name: GridCraft real XLSX + CSV + readback (with Korean)
+        run: |
+          set +e
+          G=tools/gridcraft/cli
+          $G run --sample budget --cmd 'home.bold={"range":"B4:F4"}' --out out/grid_budget.xlsx > logs/gridcraft_xlsx.txt 2>&1; echo "xlsx exit=$?" >> logs/gridcraft_xlsx.txt
+          $G run --sample budget --out out/grid.csv >> logs/gridcraft_xlsx.txt 2>&1; echo "csv exit=$?" >> logs/gridcraft_xlsx.txt
+          $G cat out/grid_budget.xlsx --range A1:F15 > logs/gridcraft_cat.txt 2>&1; echo "cat exit=$?" >> logs/gridcraft_cat.txt
+          $G eval '="한글 셀"' > logs/gridcraft_korean.txt 2>&1; echo "eval exit=$?" >> logs/gridcraft_korean.txt
+          echo "--- gridcraft xlsx/csv ---"; cat logs/gridcraft_xlsx.txt; file out/grid_budget.xlsx out/grid.csv 2>&1
+          echo "--- cat readback ---"; head -20 logs/gridcraft_cat.txt
+          echo "--- korean eval ---"; cat logs/gridcraft_korean.txt
+
+      - name: MCP init + tools/list + real tools/call (no-arg tool) for each tool
+        run: |
+          set +e
+          cat > /tmp/mcp3.py <<'PYEOF'
+          import json, subprocess, sys, threading, queue
+          def rd(p, sec):
+              r = queue.Queue()
+              def w():
+                  try: r.put(p.stdout.readline())
+                  except Exception as e: r.put(("ERR", str(e)))
+              t = threading.Thread(target=w, daemon=True); t.start(); t.join(sec)
+              if t.is_alive(): return "<TIMEOUT>"
+              v = r.get()
+              return ("<ERR:%s>" % v[1]) if isinstance(v, tuple) else v
+          def send(p, o): p.stdin.write(json.dumps(o) + "\n"); p.stdin.flush()
+          b = sys.argv[1]
+          p = subprocess.Popen([b, "mcp"], stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, bufsize=1)
+          out = {}
+          try:
+              send(p, {"jsonrpc":"2.0","id":1,"method":"initialize",
+                       "params":{"protocolVersion":"2025-06-18","capabilities":{},
+                                 "clientInfo":{"name":"artcraft3-verify","version":"0"}}})
+              line = rd(p,12)
+              out["init"] = "OK" if isinstance(line,str) and line.strip().startswith("{") else ("BAD:"+str(line)[:120])
+              send(p, {"jsonrpc":"2.0","method":"notifications/initialized"})
+              send(p, {"jsonrpc":"2.0","id":2,"method":"tools/list","params":{}})
+              line2 = rd(p,20)
+              tools=[]
+              try:
+                  msg=json.loads(line2); tools=msg.get("result",{}).get("tools",[])
+              except Exception as e:
+                  out["tools_list"]="PARSE_ERR:"+str(e)
+              out["tool_count"]=len(tools)
+              out["tool_names"]=[t.get("name") for t in tools][:80]
+              cand=[t for t in tools if not (t.get("inputSchema",{}) or {}).get("required")]
+              pick=(cand[0] if cand else (tools[0] if tools else None))
+              if pick:
+                  send(p, {"jsonrpc":"2.0","id":3,"method":"tools/call",
+                           "params":{"name":pick["name"],"arguments":{}}})
+                  resp=rd(p,25)
+                  try:
+                      rr=json.loads(resp); err=bool(rr.get("error")) or bool(rr.get("result",{}).get("isError"))
+                      out["call_"+pick["name"]]="OK" if not err else "ERR"
+                      out["call_detail"]=json.dumps(rr,ensure_ascii=False)[:400]
+                  except Exception:
+                      out["call_"+pick["name"]]="NO_RESPONSE:"+str(resp)[:120]
+          except Exception as e:
+              out["error"]=str(e)
+          finally:
+              try: p.kill()
+              except Exception: pass
+          print(json.dumps(out, ensure_ascii=False, indent=2))
+          PYEOF
+          for r in wordcraft deckcraft gridcraft; do
+            echo "===== MCP $r ====="
+            timeout 60 python3 /tmp/mcp3.py "$(realpath tools/$r/cli)" > "logs/$r-mcp.txt" 2>&1
+            grep -oE '"(init|tool_count|call_[a-z_]+)": *("?[^,]*"?)' "logs/$r-mcp.txt" | head
+          done
+
+      - name: Summary
+        run: |
+          set +e
+          {
+            echo "# ArtCraft 추가 3종 판정"
+            echo "## CLI SHA-256"; cat logs/cli_sha256.txt
+            echo "## versions"; for r in wordcraft deckcraft gridcraft; do printf "%-11s " "$r"; head -1 "logs/$r--version.txt"; done
+            echo "## SHA vs release"; for r in wordcraft deckcraft gridcraft; do printf "%-11s " "$r"; grep -oE "OK|MISMATCH|FAILED" "logs/${r}_sha.txt" | head -1; done
+            echo "## MCP"; for r in wordcraft deckcraft gridcraft; do printf "%-11s " "$r"; grep -oE '"(tool_count|init|call_[a-z_]+)": *[^,]*' "logs/$r-mcp.txt" | tr '\n' ' '; echo; done
+            echo "## outputs (out/)"; ls -l out/ out/deck_png/ 2>/dev/null | head -40
+          } > logs/NEW3_SUMMARY.txt
+          cat logs/NEW3_SUMMARY.txt
+
+      - name: Upload logs + samples
+        uses: actions/upload-artifact@v4
+        with:
+          name: artcraft3-verify-logs
+          path: |
+            logs/
+            out/
+          if-no-files-found: warn
+          retention-days: 30
