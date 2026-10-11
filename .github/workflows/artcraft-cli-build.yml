@@ -1,0 +1,121 @@
+# ArtCraft 5종 Linux CLI 빌드 (DesignCraft, VectorCraft, LightCraft, FilmCraft, EffectCraft)
+# - Free ubuntu-latest runner only
+# - Official source cloned at build time (not stored in this repo)
+# - CLI binary only per product; GUI build is NOT counted as success
+# - Manual trigger only (workflow_dispatch) to prevent unnecessary rebuilds
+# - PhotoCraft already built separately (photocraft-cli-build.yml)
+name: ArtCraft 5-Product CLI Build (Linux)
+
+on:
+  workflow_dispatch:
+    inputs:
+      products:
+        description: 'Products to build (comma-separated, or "all")'
+        required: false
+        default: 'all'
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build-cli:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - product: designcraft
+            version: "0.6.0"
+            rust: "1.95.0"
+            crate: designcraft-cli
+          - product: vectorcraft
+            version: "0.9.0"
+            rust: "1.95.0"
+            crate: vectorcraft-cli
+          - product: lightcraft
+            version: "0.6.0"
+            rust: "1.90.0"
+            crate: lightcraft-cli
+          - product: filmcraft
+            version: "0.6.0"
+            rust: "1.95.0"
+            crate: filmcraft-cli
+          - product: effectcraft
+            version: "0.8.0"
+            rust: "1.95.0"
+            crate: effectcraft-cli
+    name: ${{ matrix.product }}-cli
+    steps:
+      - name: Check if product selected
+        id: selected
+        run: |
+          INPUTS="${{ inputs.products }}"
+          if [ "$INPUTS" = "all" ] || echo ",$INPUTS," | grep -q ",${{ matrix.product }},"; then
+            echo "run=true" >> $GITHUB_OUTPUT
+          else
+            echo "run=false" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Install Rust
+        if: steps.selected.outputs.run == 'true'
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: ${{ matrix.rust }}
+          components: rustfmt, clippy
+
+      - name: Install system dependencies
+        if: steps.selected.outputs.run == 'true'
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq \
+            pkg-config libssl-dev \
+            libxcb-render0-dev libxcb-shape0-dev libxcb-xfixes0-dev \
+            libxkbcommon-dev libgtk-3-dev 2>&1 | tail -2
+
+      - name: Clone official source
+        if: steps.selected.outputs.run == 'true'
+        run: |
+          git clone --depth 1 --branch "v${{ matrix.version }}" \
+            "https://github.com/storytold/${{ matrix.product }}.git" src
+          cd src
+          echo "=== license ==="
+          head -2 LICENSE-MIT 2>/dev/null || head -2 LICENSE-APACHE 2>/dev/null
+          grep -m1 '^license' Cargo.toml || true
+          echo "=== version ==="
+          grep -m1 '^version' Cargo.toml || true
+
+      - name: Build CLI only (release)
+        if: steps.selected.outputs.run == 'true'
+        working-directory: src
+        run: cargo build --release -p ${{ matrix.crate }}
+
+      - name: Verify CLI binary exists
+        if: steps.selected.outputs.run == 'true'
+        working-directory: src
+        run: |
+          CLI_BIN="target/release/${{ matrix.crate }}"
+          if [ ! -f "$CLI_BIN" ]; then
+            echo "FAIL: ${{ matrix.crate }} binary not produced"
+            ls -la target/release/ | head -20
+            exit 1
+          fi
+          echo "OK: CLI binary found"
+          ls -lh "$CLI_BIN"
+          file "$CLI_BIN"
+
+      - name: Smoke test --version and --help
+        if: steps.selected.outputs.run == 'true'
+        working-directory: src
+        run: |
+          ./target/release/${{ matrix.crate }} --version
+          ./target/release/${{ matrix.crate }} --help | head -30
+
+      - name: Upload CLI artifact
+        if: steps.selected.outputs.run == 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.crate }}-linux-x86_64
+          path: src/target/release/${{ matrix.crate }}
+          retention-days: 7
+          if-no-files-found: error
