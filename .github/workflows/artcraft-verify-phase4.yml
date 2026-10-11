@@ -1,0 +1,140 @@
+name: ArtCraft Verify Phase4 (all-tool MCP call)
+
+# 마무리: 7종 전부 MCP tools/call 실제 호출 성공 확보 + PdfCraft 한글 텍스트를
+# MCP 경로(doc_open->doc_info->text_extract)로 회수. doc 인자는 정수 1 로 확정(Phase3 교체).
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - artcraft-verify/qoder-iso
+
+permissions:
+  contents: read
+  actions: read
+
+jobs:
+  verify:
+    runs-on: ubuntu-24.04
+    env:
+      GH_TOKEN: ${{ github.token }}
+      REPO: woori73/feel2real-buildit2
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: 19713748f8d57ed61850a208b06c970b1e03212e
+
+      - name: Install deps
+        run: sudo apt-get update && sudo apt-get install -y fonts-noto-cjk librsvg2-bin
+
+      - name: Download 7 binaries + build Korean PDF input
+        run: |
+          set -e
+          mkdir -p dl tools logs samples pdfroot
+          gh run download 38121799371 -R "$REPO" -n photocraft-cli-linux-x86_64 -D dl/photocraft
+          gh run download 38122345286 -R "$REPO" -n designcraft-cli-linux-x86_64 -D dl/designcraft
+          gh run download 38122345286 -R "$REPO" -n vectorcraft-cli-linux-x86_64 -D dl/vectorcraft
+          gh run download 38123091969 -R "$REPO" -n lightcraft-cli-linux-x86_64 -D dl/lightcraft
+          gh run download 38122345286 -R "$REPO" -n filmcraft-cli-linux-x86_64 -D dl/filmcraft
+          gh run download 38122345286 -R "$REPO" -n effectcraft-cli-linux-x86_64 -D dl/effectcraft
+          mkdir -p dl/pdfcraft
+          curl -sSL -o dl/pdfcraft/t.tar.gz https://github.com/storytold/pdfcraft/releases/download/v0.6.0/pdfcraft-cli-0.6.0-linux-x86_64.tar.gz
+          tar -xzf dl/pdfcraft/t.tar.gz -C dl/pdfcraft
+          for tool in photocraft designcraft vectorcraft lightcraft filmcraft effectcraft pdfcraft; do
+            mkdir -p "tools/$tool"
+            found=$(find "dl/$tool" -type f \( -name "*-cli*" -o -name "*cli*" \) ! -name "*.gz" ! -name "*.txt" ! -name "*.sum" | head -1)
+            [ -z "$found" ] && found=$(find "dl/$tool" -type f -exec file {} \; | grep -m1 "ELF" | cut -d: -f1)
+            cp "$found" "tools/$tool/cli"; chmod +x "tools/$tool/cli"
+          done
+          cat > samples/korean_src.svg <<'SVG'
+          <?xml version="1.0" encoding="UTF-8"?>
+          <svg xmlns="http://www.w3.org/2000/svg" width="595" height="842">
+            <rect width="100%" height="100%" fill="#ffffff"/>
+            <text x="60" y="120" font-family="'Noto Sans CJK KR','Noto Sans KR',sans-serif" font-size="34" fill="#0c238a">테스트 한글 텍스트</text>
+            <text x="60" y="180" font-family="'Noto Sans CJK KR','Noto Sans KR',sans-serif" font-size="22" fill="#111111">월 수강료 15만원 · 상담 010-0000-0000</text>
+          </svg>
+          SVG
+          rsvg-convert -f pdf -o pdfroot/korean_src.pdf samples/korean_src.svg
+
+      - name: MCP tool-call driver
+        run: |
+          set +e
+          cat > /tmp/mcp2.py <<'PYEOF'
+          import json, subprocess, sys, threading, queue
+          def rd(p, sec):
+              r = queue.Queue()
+              def w():
+                  try: r.put(p.stdout.readline())
+                  except Exception as e: r.put(("ERR", str(e)))
+              t = threading.Thread(target=w, daemon=True); t.start(); t.join(sec)
+              if t.is_alive(): return "<TIMEOUT>"
+              v = r.get()
+              return ("<ERR:%s>" % v[1]) if isinstance(v, tuple) else v
+          def send(p, o): p.stdin.write(json.dumps(o) + "\n"); p.stdin.flush()
+          binpath = sys.argv[1]; use_root = sys.argv[2]; plan = json.loads(sys.argv[3])
+          cmd = [binpath, "mcp"] + (["--root", use_root] if use_root != "-" else [])
+          p = subprocess.Popen(cmd, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, bufsize=1)
+          out = {}
+          try:
+              send(p, {"jsonrpc":"2.0","id":1,"method":"initialize",
+                       "params":{"protocolVersion":"2025-06-18","capabilities":{},
+                                 "clientInfo":{"name":"artcraft-verify","version":"0"}}})
+              out["init"] = "OK" if rd(p,12).strip().startswith("{") else "BAD"
+              send(p, {"jsonrpc":"2.0","method":"notifications/initialized"})
+              for i, spec in enumerate(plan, start=10):
+                  send(p, {"jsonrpc":"2.0","id":i,"method":"tools/call",
+                           "params":{"name":spec["name"],"arguments":spec.get("args",{})}})
+                  line = rd(p, 25)
+                  try: resp = json.loads(line)
+                  except Exception: out[spec["name"]] = "NO_RESPONSE"; continue
+                  err = bool(resp.get("error")) or bool(resp.get("result",{}).get("isError"))
+                  out[spec["name"]] = "OK" if not err else "ERR"
+                  if spec.get("want"):
+                      try:
+                          sc = resp.get("result",{}).get("structuredContent")
+                          txt = sc if sc else resp["result"]["content"][0]["text"]
+                          out[spec["name"]+"_out"] = (json.dumps(sc,ensure_ascii=False) if isinstance(sc,(dict,list)) else str(txt))[:800]
+                      except Exception as e: out[spec["name"]+"_out"] = "PARSE:"+str(e)
+          except Exception as e:
+              out["error"] = str(e)
+          finally:
+              try: p.kill()
+              except Exception: pass
+          print(json.dumps(out, ensure_ascii=False, indent=2))
+          PYEOF
+          PDFROOT="$(realpath pdfroot)"
+          echo "===== photocraft: command_list (실호출) ====="
+          timeout 60 python3 /tmp/mcp2.py "$(realpath tools/photocraft/cli)" "-" '[{"name":"command_list","args":{}}]' > logs/photocraft-mcp.txt 2>&1; grep -oE '"(init|command_list)": *"[^"]*"' logs/photocraft-mcp.txt
+          echo "===== pdfcraft: doc_open -> doc_info(1) -> text_extract(1) 한글 ====="
+          timeout 90 python3 /tmp/mcp2.py "$(realpath tools/pdfcraft/cli)" "$PDFROOT" \
+            '[{"name":"doc_open","args":{"path":"korean_src.pdf"}},{"name":"doc_info","args":{"doc":1},"want":true},{"name":"text_extract","args":{"doc":1},"want":true}]' \
+            > logs/pdfcraft-mcp.txt 2>&1; cat logs/pdfcraft-mcp.txt
+          for pair in "designcraft:list_commands" "vectorcraft:command_list" "lightcraft:command_list" "filmcraft:command_list" "effectcraft:list_commands"; do
+            t=${pair%%:*}; c=${pair##*:}
+            echo "===== $t: $c (실호출) ====="
+            timeout 60 python3 /tmp/mcp2.py "$(realpath tools/$t/cli)" "-" "[{\"name\":\"$c\",\"args\":{}}]" > "logs/$t-mcp.txt" 2>&1
+            grep -oE '"(init|'"$c"')": *"[^"]*"' "logs/$t-mcp.txt"
+          done
+
+      - name: Report
+        run: |
+          set +e
+          {
+            echo "# Phase4 MCP 실제 도구 호출 판정 (7종)"
+            for t in photocraft designcraft vectorcraft lightcraft filmcraft effectcraft; do
+              printf "%-12s init=" "$t"; grep -oE '"init": *"[^"]*"' logs/$t-mcp.txt | head -1
+              grep -oE '"[a-z_]+": *"(OK|ERR|NO_RESPONSE)"' logs/$t-mcp.txt | grep -v init
+            done
+            printf "%-12s " pdfcraft; grep -oE '"(doc_open|doc_info|text_extract)": *"(OK|ERR)"' logs/pdfcraft-mcp.txt | tr '\n' ' '; echo
+            echo "## pdfcraft MCP 한글 텍스트 회수:"; grep -A1 'text_extract_out' logs/pdfcraft-mcp.txt | head -5
+          } > logs/PHASE4_SUMMARY.txt
+          cat logs/PHASE4_SUMMARY.txt
+
+      - name: Upload Phase4
+        uses: actions/upload-artifact@v4
+        with:
+          name: artcraft-verify-phase4
+          path: |
+            logs/
+            pdfroot/
+          if-no-files-found: warn
+          retention-days: 30
