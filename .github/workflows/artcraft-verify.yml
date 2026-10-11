@@ -1,0 +1,215 @@
+name: ArtCraft Verify (isolated)
+
+# 격리 실행 검증: Windows Git Bash では Linux ELF 를 실행 불가하므로
+# GitHub Actions Linux runner(Ubuntu 24.04) 를 격리 환경으로 사용한다.
+# 빌드 성공 = PASS 가 아니라, 실제 CLI 실행/결과물/한글/MCP 응답으로 판정한다.
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  actions: read
+
+jobs:
+  verify:
+    runs-on: ubuntu-24.04
+    env:
+      GH_TOKEN: ${{ github.token }}
+      REPO: woori73/feel2real-buildit2
+    steps:
+      - name: Checkout (docs/CHECKSUMS reference at base commit)
+        uses: actions/checkout@v4
+        with:
+          ref: 19713748f8d57ed61850a208b06c970b1e03212e
+
+      - name: Install isolated env deps (Korean fonts + system tools)
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y fonts-noto-cjk fonts-nanum imagemagick librsvg2-bin ffmpeg
+          fc-list | grep -iE "noto.*cjk|nanum" | head -20 || true
+
+      - name: Prepare dirs
+        run: mkdir -p dl tools logs samples
+
+      # ---- 6종: GitHub Actions 아티팩트 (buildit2 의既往 runs) ----
+      - name: Download PhotoCraft artifact
+        run: gh run download 38121799371 -R "$REPO" -n photocraft-cli-linux-x86_64 -D dl/photocraft
+      - name: Download DesignCraft artifact
+        run: gh run download 38122345286 -R "$REPO" -n designcraft-cli-linux-x86_64 -D dl/designcraft
+      - name: Download VectorCraft artifact
+        run: gh run download 38122345286 -R "$REPO" -n vectorcraft-cli-linux-x86_64 -D dl/vectorcraft
+      - name: Download LightCraft artifact
+        run: gh run download 38123091969 -R "$REPO" -n lightcraft-cli-linux-x86_64 -D dl/lightcraft
+      - name: Download FilmCraft artifact
+        run: gh run download 38122345286 -R "$REPO" -n filmcraft-cli-linux-x86_64 -D dl/filmcraft
+      - name: Download EffectCraft artifact
+        run: gh run download 38122345286 -R "$REPO" -n effectcraft-cli-linux-x86_64 -D dl/effectcraft
+
+      # ---- PdfCraft: Muse VM 복사 금지 — GitHub 원본 저장소에서 직접 확보 ----
+      - name: Download PdfCraft from ORIGINAL repo (storytold/pdfcraft v0.6.0)
+        run: |
+          set -e
+          mkdir -p dl/pdfcraft
+          curl -sSL -o dl/pdfcraft/pdfcraft-cli-0.6.0-linux-x86_64.tar.gz \
+            https://github.com/storytold/pdfcraft/releases/download/v0.6.0/pdfcraft-cli-0.6.0-linux-x86_64.tar.gz
+          curl -sSL -o dl/pdfcraft/SHA256SUMS.txt \
+            https://github.com/storytold/pdfcraft/releases/download/v0.6.0/SHA256SUMS.txt
+
+      - name: Verify PdfCraft checksum (release SHA256SUMS + buildit2 CHECKSUMS)
+        run: |
+          cd dl/pdfcraft
+          echo "--- release SHA256SUMS.txt verify (linux-x86_64 cli tarball) ---"
+          grep 'pdfcraft-cli-0.6.0-linux-x86_64.tar.gz' SHA256SUMS.txt | sha256sum -c - 2>&1 | tee ../../logs/pdfcraft_sha_verify.txt
+          echo "--- cross-check vs buildit2 artcraft/CHECKSUMS.txt ---"
+          EXPECTED=$(awk '/pdfcraft-cli-0.6.0-linux-x86_64.tar.gz/{print $1}' ../../artcraft/CHECKSUMS.txt)
+          ACTUAL=$(sha256sum pdfcraft-cli-0.6.0-linux-x86_64.tar.gz | awk '{print $1}')
+          echo "expected(buildit2)=$EXPECTED" | tee -a ../../logs/pdfcraft_sha_verify.txt
+          echo "actual(original)  =$ACTUAL" | tee -a ../../logs/pdfcraft_sha_verify.txt
+          [ "$EXPECTED" = "$ACTUAL" ] && echo "CROSSCHECK=MATCH" | tee -a ../../logs/pdfcraft_sha_verify.txt \
+            || echo "CROSSCHECK=MISMATCH" | tee -a ../../logs/pdfcraft_sha_verify.txt
+
+      - name: Extract + normalize all binaries, record per-binary SHA-256
+        run: |
+          set +e
+          # PdfCraft tarball 전개
+          tar -xzf dl/pdfcraft/pdfcraft-cli-0.6.0-linux-x86_64.tar.gz -C dl/pdfcraft
+          for tool in photocraft designcraft vectorcraft lightcraft filmcraft effectcraft pdfcraft; do
+            mkdir -p "tools/$tool"
+            # dl 아래에서 ELF 실행파일을 찾아 tools/<tool>/cli 로 표준화
+            found=$(find "dl/$tool" -type f \( -name "*-cli*" -o -name "*cli*" \) | head -1)
+            if [ -z "$found" ]; then found=$(find "dl/$tool" -type f -exec file {} \; | grep -m1 "ELF" | cut -d: -f1); fi
+            if [ -n "$found" ]; then
+              cp "$found" "tools/$tool/cli"
+              chmod +x "tools/$tool/cli"
+              ( cd "tools/$tool" && sha256sum cli ) >> logs/binary_sha256.txt
+              file "tools/$tool/cli" >> logs/binary_filetype.txt
+              echo "OK $tool <- $found"
+            else
+              echo "MISS $tool"
+            fi
+          done
+          cat logs/binary_sha256.txt
+
+      - name: Discover CLI (version + help + ldd) for each tool
+        run: |
+          set +e
+          for tool in photocraft designcraft vectorcraft lightcraft filmcraft effectcraft pdfcraft; do
+            b="tools/$tool/cli"
+            [ -x "$b" ] || { echo "MISSING $tool" | tee "logs/$tool--version.txt"; continue; }
+            echo "===== $tool --version ====="
+            "$b" --version > "logs/$tool--version.txt" 2>&1; echo "exit=$?" >> "logs/$tool--version.txt"
+            cat "logs/$tool--version.txt"
+            echo "===== $tool --help ====="
+            "$b" --help > "logs/$tool--help.txt" 2>&1; echo "exit=$?" >> "logs/$tool--help.txt"
+            ldd "$b" > "logs/$tool--ldd.txt" 2>&1 || true
+          done
+
+      - name: MCP initialize + tools/list for each tool (stdio JSON-RPC)
+        run: |
+          set +e
+          cat > /tmp/mcp_probe.py <<'PYEOF'
+          import json, subprocess, sys, threading, queue
+          def readline_timeout(p, sec):
+              r = queue.Queue()
+              def w():
+                  try: r.put(p.stdout.readline())
+                  except Exception as e: r.put(("ERR", str(e)))
+              t = threading.Thread(target=w, daemon=True); t.start(); t.join(sec)
+              if t.is_alive(): return "<TIMEOUT>"
+              v = r.get()
+              if isinstance(v, tuple) and v and v[0] == "ERR": return "<ERR:" + v[1] + ">"
+              return v
+          name = sys.argv[1]; b = sys.argv[2]
+          out = {"tool": name}
+          try:
+              p = subprocess.Popen([b, "mcp"], stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                                    stderr=subprocess.PIPE, text=True, bufsize=1)
+              init = {"jsonrpc":"2.0","id":1,"method":"initialize",
+                      "params":{"protocolVersion":"2025-06-18","capabilities":{},
+                                "clientInfo":{"name":"artcraft-verify","version":"0"}}}
+              p.stdin.write(json.dumps(init)+"\n"); p.stdin.flush()
+              line = readline_timeout(p, 12)
+              out["initialize"] = line.strip() if isinstance(line, str) and line.strip() else line
+              p.stdin.write(json.dumps({"jsonrpc":"2.0","method":"notifications/initialized"})+"\n"); p.stdin.flush()
+              p.stdin.write(json.dumps({"jsonrpc":"2.0","id":2,"method":"tools/list","params":{}})+"\n"); p.stdin.flush()
+              line2 = readline_timeout(p, 15)
+              out["tools_list_raw"] = (line2 or "").strip() if isinstance(line2, str) else line2
+              try:
+                  msg = json.loads(line2)
+                  tools = msg.get("result", {}).get("tools", [])
+                  out["tool_count"] = len(tools)
+                  out["tool_names"] = [t.get("name") for t in tools][:60]
+              except Exception as e:
+                  out["tool_count"] = "PARSE_ERR:" + str(e)
+              try:
+                  p.kill()
+              except Exception:
+                  pass
+          except Exception as e:
+              out["error"] = str(e)
+          print(json.dumps(out, ensure_ascii=False, indent=2))
+          PYEOF
+          for tool in photocraft designcraft vectorcraft lightcraft filmcraft effectcraft pdfcraft; do
+            b="tools/$tool/cli"
+            [ -x "$b" ] || { echo "{\"error\":\"MISSING\"}" > "logs/$tool-mcp.txt"; continue; }
+            timeout 40 python3 /tmp/mcp_probe.py "$tool" "$(realpath "$b")" > "logs/$tool-mcp.txt" 2>&1
+            echo "===== MCP $tool ====="; cat "logs/$tool-mcp.txt"
+          done
+
+      - name: Sample generation (PhotoCraft real convert + PdfCraft from help)
+        run: |
+          set +e
+          # PhotoCraft: ImageMagick 으로 한글 라벨 PNG 생성 -> convert -> info
+          convert -size 400x200 xc:'#0C238A' -fill white -font Noto-Sans-CJK-KR-Bold \
+            -pointsize 34 -annotate +40+110 '테스트 한글' samples/photo_in.png 2>logs/photo_magick_err.txt || \
+          convert -size 400x200 xc:'#0C238A' -fill white -pointsize 34 -annotate +40+110 '테스트' samples/photo_in.png
+          b=tools/photocraft/cli
+          "$b" info samples/photo_in.png > logs/photocraft_info.txt 2>&1; echo "exit=$?" >> logs/photocraft_info.txt
+          "$b" convert samples/photo_in.png samples/photo_out.jpg --quality 90 > logs/photocraft_convert.txt 2>&1; echo "exit=$?" >> logs/photocraft_convert.txt
+          file samples/photo_out.jpg >> logs/photocraft_convert.txt 2>&1
+          ls -l samples/ >> logs/photocraft_convert.txt 2>&1
+          # PdfCraft: --help 로 발견된 하위 커맨드 로그 (샘플 생성 커맨드 파악용)
+          echo "----- pdfcraft help -----" > logs/pdfcraft_help_dump.txt
+          tools/pdfcraft/cli --help >> logs/pdfcraft_help_dump.txt 2>&1 || true
+
+      - name: Korean filename + output round-trip (Photocraft)
+        run: |
+          set +e
+          cp samples/photo_in.png "samples/한글_파일명_테스트.png" 2>/dev/null
+          tools/photocraft/cli info "samples/한글_파일명_테스트.png" > logs/photocraft_korean_name.txt 2>&1
+          echo "exit=$?" >> logs/photocraft_korean_name.txt
+          cat logs/photocraft_korean_name.txt
+
+      - name: Summary
+        run: |
+          set +e
+          {
+            echo "# ArtCraft 7종 격리 실행 검증 요약"
+            echo
+            echo "## binary SHA-256"
+            cat logs/binary_sha256.txt 2>/dev/null
+            echo
+            echo "## versions"
+            for t in photocraft designcraft vectorcraft lightcraft filmcraft effectcraft pdfcraft; do
+              printf "%-12s " "$t"; head -1 "logs/$t--version.txt" 2>/dev/null
+            done
+            echo
+            echo "## MCP tool_count"
+            for t in photocraft designcraft vectorcraft lightcraft filmcraft effectcraft pdfcraft; do
+              printf "%-12s " "$t"; grep -o '"tool_count":[^,}]*' "logs/$t-mcp.txt" 2>/dev/null | head -1
+            done
+            echo
+            echo "## PdfCraft checksum"
+            cat logs/pdfcraft_sha_verify.txt 2>/dev/null
+          } > logs/README_SUMMARY.txt
+          cat logs/README_SUMMARY.txt
+
+      - name: Upload verification logs + samples
+        uses: actions/upload-artifact@v4
+        with:
+          name: artcraft-verify-logs
+          path: |
+            logs/
+            samples/
+          if-no-files-found: warn
+          retention-days: 30
