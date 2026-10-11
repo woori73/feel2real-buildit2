@@ -5,6 +5,9 @@ name: ArtCraft Verify (isolated)
 # 빌드 성공 = PASS 가 아니라, 실제 CLI 실행/결과물/한글/MCP 응답으로 판정한다.
 on:
   workflow_dispatch:
+  push:
+    branches:
+      - artcraft-verify/qoder-iso
 
 permissions:
   contents: read
