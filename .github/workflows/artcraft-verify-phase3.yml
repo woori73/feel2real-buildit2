@@ -1,0 +1,174 @@
+name: ArtCraft Verify Phase3 (clean tool-call)
+
+# Phase2 의 harness 버전만 교정: render 1-based, MCP --root 을 파일 포함 디렉토리로,
+# doc_open->doc_info 체이닝(핸드 캡처), photocraft mcp 는 --root 없이(Phase1 정상).
+# 도구 자체 결함이 아니라 검증 스크립트 결함 재현 -> 실제 성공 호출 확보.
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - artcraft-verify/qoder-iso
+
+permissions:
+  contents: read
+  actions: read
+
+jobs:
+  verify:
+    runs-on: ubuntu-24.04
+    env:
+      GH_TOKEN: ${{ github.token }}
+      REPO: woori73/feel2real-buildit2
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: 19713748f8d57ed61850a208b06c970b1e03212e
+
+      - name: Install deps
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y fonts-noto-cjk imagemagick librsvg2-bin
+
+      - name: Prepare + download binaries
+        run: |
+          set -e
+          mkdir -p dl tools logs samples out pdfroot
+          gh run download 38121799371 -R "$REPO" -n photocraft-cli-linux-x86_64 -D dl/photocraft
+          for tool in designcraft vectorcraft lightcraft filmcraft effectcraft; do
+            mkdir -p "dl/$tool"
+          done
+          gh run download 38122345286 -R "$REPO" -n designcraft-cli-linux-x86_64 -D dl/designcraft
+          gh run download 38122345286 -R "$REPO" -n vectorcraft-cli-linux-x86_64 -D dl/vectorcraft
+          gh run download 38123091969 -R "$REPO" -n lightcraft-cli-linux-x86_64 -D dl/lightcraft
+          gh run download 38122345286 -R "$REPO" -n filmcraft-cli-linux-x86_64 -D dl/filmcraft
+          gh run download 38122345286 -R "$REPO" -n effectcraft-cli-linux-x86_64 -D dl/effectcraft
+          mkdir -p dl/pdfcraft
+          curl -sSL -o dl/pdfcraft/t.tar.gz https://github.com/storytold/pdfcraft/releases/download/v0.6.0/pdfcraft-cli-0.6.0-linux-x86_64.tar.gz
+          tar -xzf dl/pdfcraft/t.tar.gz -C dl/pdfcraft
+          for tool in photocraft designcraft vectorcraft lightcraft filmcraft effectcraft pdfcraft; do
+            mkdir -p "tools/$tool"
+            found=$(find "dl/$tool" -type f \( -name "*-cli*" -o -name "*cli*" \) ! -name "*.gz" ! -name "*.txt" ! -name "*.sum" | head -1)
+            [ -z "$found" ] && found=$(find "dl/$tool" -type f -exec file {} \; | grep -m1 "ELF" | cut -d: -f1)
+            cp "$found" "tools/$tool/cli"; chmod +x "tools/$tool/cli"
+          done
+
+      - name: Build Korean PDF input
+        run: |
+          set +e
+          cat > samples/korean_src.svg <<'SVG'
+          <?xml version="1.0" encoding="UTF-8"?>
+          <svg xmlns="http://www.w3.org/2000/svg" width="595" height="842">
+            <rect width="100%" height="100%" fill="#ffffff"/>
+            <text x="60" y="120" font-family="'Noto Sans CJK KR','Noto Sans KR',sans-serif" font-size="34" fill="#0c238a">테스트 한글 텍스트</text>
+            <text x="60" y="180" font-family="'Noto Sans CJK KR','Noto Sans KR',sans-serif" font-size="22" fill="#111111">월 수강료 15만원 · 상담 010-0000-0000</text>
+          </svg>
+          SVG
+          rsvg-convert -f pdf -o samples/korean_src.pdf samples/korean_src.svg 2>logs/svggen.txt; echo "rsvg exit=$?" >> logs/svggen.txt
+          # render 1-based 재시도
+          tools/pdfcraft/cli render samples/korean_src.pdf --page 1 --dpi 150 --out out/pdfcraft_render.png > logs/pdfcraft_render.txt 2>&1; echo "exit=$?" >> logs/pdfcraft_render.txt
+          file out/pdfcraft_render.png >> logs/pdfcraft_render.txt 2>&1
+          cat logs/pdfcraft_render.txt
+
+      - name: MCP chained real tool calls (photocraft + pdfcraft)
+        run: |
+          set +e
+          cat > /tmp/mcp_chain.py <<'PYEOF'
+          import json, subprocess, sys, threading, queue, re
+          def rd(p, sec):
+              r = queue.Queue()
+              def w():
+                  try: r.put(p.stdout.readline())
+                  except Exception as e: r.put(("ERR", str(e)))
+              t = threading.Thread(target=w, daemon=True); t.start(); t.join(sec)
+              if t.is_alive(): return "<TIMEOUT>"
+              v = r.get()
+              return ("<ERR:%s>" % v[1]) if isinstance(v, tuple) else v
+          def send(p, o): p.stdin.write(json.dumps(o) + "\n"); p.stdin.flush()
+          def sub(args, vars):
+              s = json.dumps(args)
+              for k, v in vars.items(): s = s.replace("{%s}" % k, str(v))
+              return json.loads(s)
+          def extract_id(resp):
+              # result.content[0].text -> json or raw token; find a doc handle
+              try:
+                  res = resp.get("result", {})
+                  txt = res["content"][0]["text"]
+              except Exception:
+                  return None
+              try:
+                  d = json.loads(txt)
+                  if isinstance(d, dict):
+                      for key in ("doc", "docId", "documentId", "id", "sessionId"):
+                          if key in d: return d[key]
+              except Exception:
+                  pass
+              m = re.search(r'"(doc|docId|documentId|id)"\s*:\s*"?([A-Za-z0-9_\-]+)"?', txt)
+              return m.group(2) if m else None
+          binpath = sys.argv[1]; use_root = sys.argv[2]; plan = json.loads(sys.argv[3])
+          cmd = [binpath, "mcp"] + (["--root", use_root] if use_root != "-" else [])
+          p = subprocess.Popen(cmd, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                                stderr=subprocess.PIPE, text=True, bufsize=1)
+          out = {"cmd": cmd}; vars = {}
+          try:
+              send(p, {"jsonrpc":"2.0","id":1,"method":"initialize",
+                       "params":{"protocolVersion":"2025-06-18","capabilities":{},
+                                 "clientInfo":{"name":"artcraft-verify","version":"0"}}})
+              out["init"] = (rd(p, 12) or "").strip()[:180]
+              send(p, {"jsonrpc":"2.0","method":"notifications/initialized"})
+              for i, spec in enumerate(plan, start=10):
+                  send(p, {"jsonrpc":"2.0","id":i,"method":"tools/call",
+                           "params":{"name":spec["name"],"arguments":sub(spec.get("args",{}),vars)}})
+                  line = rd(p, 25)
+                  try: resp = json.loads(line)
+                  except Exception: out[spec["name"]] = {"raw": (line or "")[:400]}; continue
+                  err = bool(resp.get("error")) or bool(resp.get("result",{}).get("isError"))
+                  out[spec["name"]] = "OK" if not err else "ERR"
+                  out[spec["name"]+"_detail"] = json.dumps(resp, ensure_ascii=False)[:600]
+                  if not err and spec.get("save"):
+                      vars[spec["save"]] = extract_id(resp)
+          except Exception as e:
+              out["error"] = str(e)
+          finally:
+              try: p.kill()
+              except Exception: pass
+          print(json.dumps(out, ensure_ascii=False, indent=2))
+          PYEOF
+          PDF="$(realpath samples/korean_src.pdf)"
+          cp samples/korean_src.pdf pdfroot/korean_src.pdf; PDFROOT="$(realpath pdfroot)"
+          echo "##### photocraft mcp (no --root) : command_list -> doc_new -> doc_export #####"
+          timeout 90 python3 /tmp/mcp_chain.py "$(realpath tools/photocraft/cli)" "-" \
+            '[{"name":"command_list","args":{},"save":"x"},{"name":"doc_new","args":{"width":220,"height":140}}]' \
+            > logs/photocraft-mcpcall.txt 2>&1; cat logs/photocraft-mcpcall.txt
+          echo "##### pdfcraft mcp (--root=pdfroot) : doc_open -> doc_info chain #####"
+          timeout 90 python3 /tmp/mcp_chain.py "$(realpath tools/pdfcraft/cli)" "$PDFROOT" \
+            '[{"name":"doc_open","args":{"path":"korean_src.pdf"},"save":"doc"},{"name":"doc_info","args":{"doc":"{doc}"}}]' \
+            > logs/pdfcraft-mcpcall.txt 2>&1; cat logs/pdfcraft-mcpcall.txt
+          echo "##### pdfcraft run --script (도구 엔진 실호출, 루트 내) #####"
+          cat > pdfroot/steps.json <<'J'
+          [{"tool":"doc_open","args":{"path":"korean_src.pdf"}},
+           {"tool":"doc_info","args":{}},
+           {"tool":"text_extract","args":{}}]
+          J
+          ( cd pdfroot && ../tools/pdfcraft/cli run --script steps.json --root . ) > logs/pdfcraft_run.txt 2>&1; echo "exit=$?" >> logs/pdfcraft_run.txt
+          cat logs/pdfcraft_run.txt
+
+      - name: Report
+        run: |
+          set +e
+          {
+            echo "## render 1-based"; tail -2 logs/pdfcraft_render.txt
+            echo "## photocraft mcp"; grep -oE '"(command_list|doc_new)": *"(OK|ERR)"' logs/photocraft-mcpcall.txt
+            echo "## pdfcraft mcp chain"; grep -oE '"(doc_open|doc_info)": *"(OK|ERR)"' logs/pdfcraft-mcpcall.txt
+            echo "## pdfcraft run exit"; tail -1 logs/pdfcraft_run.txt
+          } > logs/PHASE3_SUMMARY.txt
+          cat logs/PHASE3_SUMMARY.txt
+
+      - name: Upload Phase3
+        uses: actions/upload-artifact@v4
+        with:
+          name: artcraft-verify-phase3
+          path: |
+            logs/
+            out/
+          if-no-files-found: warn
+          retention-days: 30
