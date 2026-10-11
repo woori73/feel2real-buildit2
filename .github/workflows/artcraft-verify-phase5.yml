@@ -1,0 +1,119 @@
+name: ArtCraft Verify Phase5 (sample artifacts)
+
+# 나머지 5종(design/vector/light/film/effect)의 실제 샘플 결과물 생성.
+# 각 도구의 headless CLI 데모/샘플/변환/렌더 경로로 파일을 만들고 file/크기로 판정.
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - artcraft-verify/qoder-iso
+
+permissions:
+  contents: read
+  actions: read
+
+jobs:
+  verify:
+    runs-on: ubuntu-24.04
+    env:
+      GH_TOKEN: ${{ github.token }}
+      REPO: woori73/feel2real-buildit2
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: 19713748f8d57ed61850a208b06c970b1e03212e
+
+      - name: Install deps
+        run: sudo apt-get update && sudo apt-get install -y fonts-noto-cjk imagemagick librsvg2-bin ffmpeg
+
+      - name: Download 7 binaries
+        run: |
+          set -e
+          mkdir -p dl tools logs samples out
+          gh run download 38122345286 -R "$REPO" -n designcraft-cli-linux-x86_64 -D dl/designcraft
+          gh run download 38122345286 -R "$REPO" -n vectorcraft-cli-linux-x86_64 -D dl/vectorcraft
+          gh run download 38123091969 -R "$REPO" -n lightcraft-cli-linux-x86_64 -D dl/lightcraft
+          gh run download 38122345286 -R "$REPO" -n filmcraft-cli-linux-x86_64 -D dl/filmcraft
+          gh run download 38122345286 -R "$REPO" -n effectcraft-cli-linux-x86_64 -D dl/effectcraft
+          for tool in designcraft vectorcraft lightcraft filmcraft effectcraft; do
+            mkdir -p "tools/$tool"
+            found=$(find "dl/$tool" -type f \( -name "*-cli*" -o -name "*cli*" \) ! -name "*.gz" ! -name "*.txt" | head -1)
+            [ -z "$found" ] && found=$(find "dl/$tool" -type f -exec file {} \; | grep -m1 "ELF" | cut -d: -f1)
+            cp "$found" "tools/$tool/cli"; chmod +x "tools/$tool/cli"
+          done
+          # 입력 소재: 사진(lightcraft) + 한글 SVG(vectorcraft)
+          convert -size 1200x800 gradient:'#2b3a9e-#e8ecf5' -fill white -font Noto-Sans-CJK-KR -pointsize 48 -annotate +60+420 '샘플 사진' samples/photo.jpg
+          cat > samples/korean_src.svg <<'SVG'
+          <?xml version="1.0" encoding="UTF-8"?>
+          <svg xmlns="http://www.w3.org/2000/svg" width="595" height="842">
+            <rect width="100%" height="100%" fill="#ffffff"/>
+            <text x="60" y="120" font-family="'Noto Sans CJK KR',sans-serif" font-size="34" fill="#0c238a">벡터 한글 테스트</text>
+          </svg>
+          SVG
+
+      - name: DesignCraft sample (run --sample --export)
+        run: |
+          set +e
+          D=tools/designcraft/cli
+          $D run --sample --export out/design_page.png > logs/designcraft_sample.txt 2>&1; echo "exit=$?" >> logs/designcraft_sample.txt
+          $D run --sample --export out/design_page.pdf >> logs/designcraft_sample.txt 2>&1; echo "pdf exit=$?" >> logs/designcraft_sample.txt
+          tail -6 logs/designcraft_sample.txt; file out/design_page.* 2>&1 | tee -a logs/designcraft_sample.txt
+
+      - name: VectorCraft sample (convert SVG -> PNG/PDF + info)
+        run: |
+          set +e
+          V=tools/vectorcraft/cli
+          $V convert samples/korean_src.svg out/vector_export.png > logs/vectorcraft_sample.txt 2>&1; echo "png exit=$?" >> logs/vectorcraft_sample.txt
+          $V convert samples/korean_src.svg out/vector_export.pdf >> logs/vectorcraft_sample.txt 2>&1; echo "pdf exit=$?" >> logs/vectorcraft_sample.txt
+          $V info out/vector_export.pdf >> logs/vectorcraft_sample.txt 2>&1; echo "info exit=$?" >> logs/vectorcraft_sample.txt
+          tail -8 logs/vectorcraft_sample.txt; file out/vector_export.* 2>&1 | tee -a logs/vectorcraft_sample.txt
+
+      - name: LightCraft sample (render develop + export)
+        run: |
+          set +e
+          L=tools/lightcraft/cli
+          $L render samples/photo.jpg -o out/light_graded.jpg --set light.exposure=0.5 --size 800 > logs/lightcraft_sample.txt 2>&1; echo "exit=$?" >> logs/lightcraft_sample.txt
+          $L render samples/photo.jpg -o out/light_graded.png --set light.contrast=10 >> logs/lightcraft_sample.txt 2>&1; echo "png exit=$?" >> logs/lightcraft_sample.txt
+          tail -8 logs/lightcraft_sample.txt; file out/light_graded.* 2>&1 | tee -a logs/lightcraft_sample.txt
+
+      - name: FilmCraft sample (demo render frame + export)
+        run: |
+          set +e
+          F=tools/filmcraft/cli
+          $F --demo render --seconds 1 --out out/film_frame.png > logs/filmcraft_sample.txt 2>&1; echo "frame exit=$?" >> logs/filmcraft_sample.txt
+          timeout 180 $F --demo export out/film_clip.mp4 --format h264 --range entire >> logs/filmcraft_sample.txt 2>&1; echo "export exit=$?" >> logs/filmcraft_sample.txt
+          tail -10 logs/filmcraft_sample.txt; file out/film_frame.png out/film_clip.mp4 2>&1 | tee -a logs/filmcraft_sample.txt
+
+      - name: EffectCraft sample (demo info + render-frame + render png)
+        run: |
+          set +e
+          E=tools/effectcraft/cli
+          $E --demo info --json > logs/effectcraft_sample.txt 2>&1; echo "info exit=$?" >> logs/effectcraft_sample.txt
+          $E --demo render-frame --out out/effect_frame.png --scale 0.5 >> logs/effectcraft_sample.txt 2>&1; echo "frame exit=$?" >> logs/effectcraft_sample.txt
+          $E --demo render --out out/effect_clip.mp4 --format h264 --resolution half --fps 24 >> logs/effectcraft_sample.txt 2>&1; echo "render exit=$?" >> logs/effectcraft_sample.txt
+          tail -12 logs/effectcraft_sample.txt; file out/effect_frame.png out/effect_clip.mp4 2>&1 | tee -a logs/effectcraft_sample.txt
+
+      - name: Report sample artifacts
+        run: |
+          set +e
+          {
+            echo "# Phase5 실제 샘플 결과물"
+            ls -l out/
+            echo "## 파일 형식"
+            file out/* 2>/dev/null
+            echo "## 도구별 최종 exit"
+            for t in designcraft vectorcraft lightcraft filmcraft effectcraft; do
+              printf "%-12s " "$t"; grep -h "exit=" "logs/$t_sample.txt" 2>/dev/null | tr '\n' ' '; echo
+            done
+          } > logs/PHASE5_SUMMARY.txt
+          cat logs/PHASE5_SUMMARY.txt
+
+      - name: Upload Phase5
+        uses: actions/upload-artifact@v4
+        with:
+          name: artcraft-verify-phase5
+          path: |
+            logs/
+            out/
+          if-no-files-found: warn
+          retention-days: 30
