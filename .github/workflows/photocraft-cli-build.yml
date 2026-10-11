@@ -1,0 +1,76 @@
+# PhotoCraft Linux CLI test build
+# - Free ubuntu-latest runner only
+# - Official source cloned at build time (not stored in this repo)
+# - CLI binary only; GUI build is NOT counted as success
+# - Manual trigger only (workflow_dispatch) to prevent unnecessary rebuilds
+name: PhotoCraft CLI Build (Linux)
+
+on:
+  workflow_dispatch:
+    inputs:
+      photocraft_ref:
+        description: 'PhotoCraft git ref (tag/branch/commit)'
+        required: false
+        default: 'v0.7.0'
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build-cli:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - name: Install Rust 1.95
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.95.0
+          components: rustfmt, clippy
+
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq \
+            pkg-config libssl-dev \
+            libxcb-render0-dev libxcb-shape0-dev libxcb-xfixes0-dev \
+            libxkbcommon-dev libgtk-3-dev 2>&1 | tail -2
+
+      - name: Clone official PhotoCraft source
+        run: |
+          git clone --depth 1 --branch "${{ inputs.photocraft_ref }}" \
+            https://github.com/storytold/photocraft.git photocraft-src
+          cd photocraft-src
+          echo "LICENSE: $(head -3 LICENSE-MIT 2>/dev/null | head -1)"
+          grep -m1 '^license' Cargo.toml || true
+          grep -m1 '^version' Cargo.toml || true
+
+      - name: Build CLI only (release)
+        working-directory: photocraft-src
+        run: cargo build --release -p photocraft-cli
+
+      - name: Verify CLI binary exists (GUI alone is NOT success)
+        working-directory: photocraft-src
+        run: |
+          CLI_BIN="target/release/photocraft-cli"
+          if [ ! -f "$CLI_BIN" ]; then
+            echo "FAIL: photocraft-cli binary not produced"
+            ls -la target/release/ | head -20
+            exit 1
+          fi
+          echo "OK: CLI binary found"
+          ls -lh "$CLI_BIN"
+          file "$CLI_BIN"
+
+      - name: Smoke test --version and --help
+        working-directory: photocraft-src
+        run: |
+          ./target/release/photocraft-cli --version
+          ./target/release/photocraft-cli --help | head -40
+
+      - name: Upload CLI artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: photocraft-cli-linux-x86_64
+          path: photocraft-src/target/release/photocraft-cli
+          retention-days: 7
+          if-no-files-found: error
